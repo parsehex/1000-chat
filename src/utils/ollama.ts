@@ -1,3 +1,5 @@
+import ollama from 'ollama/browser';
+
 export interface RequestOptions {
 	model: string;
 	messages: Message[];
@@ -12,8 +14,9 @@ export interface Message {
 
 export async function checkOllama(): Promise<boolean> {
 	try {
-		const res = await fetch('/api/tags');
-		return res.ok;
+		// Just try to list models to see if it's up
+		await ollama.list();
+		return true;
 	} catch (e) {
 		console.error('Ollama check failed', e);
 		return false;
@@ -22,10 +25,8 @@ export async function checkOllama(): Promise<boolean> {
 
 export async function getTags(): Promise<string[]> {
 	try {
-		const res = await fetch('/api/tags');
-		if (!res.ok) throw new Error('Failed to fetch tags');
-		const data = await res.json();
-		return data.models.map((m: any) => m.name);
+		const res = await ollama.list();
+		return res.models.map((m) => m.name);
 	} catch (e) {
 		console.error(e);
 		return [];
@@ -33,53 +34,34 @@ export async function getTags(): Promise<string[]> {
 }
 
 export async function chat(options: RequestOptions): Promise<Message> {
-	const res = await fetch('/api/chat', {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ ...options, stream: false }),
+	const response = await ollama.chat({
+		model: options.model,
+		messages: options.messages.map((m) => ({
+			role: m.role,
+			content: m.content,
+		})),
+		stream: false,
 	});
 
-	if (!res.ok) {
-		throw new Error(`Ollama API error: ${res.statusText}`);
-	}
-
-	const data = await res.json();
-	return data.message;
+	return {
+		role: response.message.role as 'user' | 'assistant' | 'system',
+		content: response.message.content,
+	};
 }
 
-export async function getReplacements(
-	text: string,
-	invalidWords: string[],
+export async function getEmbeddings(
+	texts: string[],
 	model: string
-): Promise<Record<string, string>> {
-	if (invalidWords.length === 0) return {};
-
-	const prompt = `
-You are an assistant helping to simplify text to the 1000 most common English words.
-The user provided the text: "${text}"
-The following words are not in the 1000 common words list: ${invalidWords.join(
-		', '
-	)}
-
-Please provide a common, simple replacement for each of these words that fits the context.
-Return ONLY a JSON object mapping the original word to the replacement.
-Example: { "exacerbate": "worsen", "utilize": "use" }
-`;
-
+): Promise<number[][]> {
 	try {
-		const res = await chat({
-			model,
-			messages: [{ role: 'user', content: prompt }],
+		// ollama.embed supports batching
+		const response = await ollama.embed({
+			model: 'embeddinggemma:latest', // hardcode for now
+			input: texts,
 		});
-
-		// Parse JSON from response
-		const jsonMatch = res.content.match(/\{[\s\S]*\}/);
-		if (jsonMatch) {
-			return JSON.parse(jsonMatch[0]);
-		}
-		return {};
+		return response.embeddings;
 	} catch (e) {
-		console.error('Failed to get replacements', e);
-		return {};
+		console.error('Failed to get embeddings', e);
+		throw e;
 	}
 }
