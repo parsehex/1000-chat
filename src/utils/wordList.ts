@@ -28,30 +28,28 @@ export function isValid(word: string): boolean {
 	return wordsSet.has(clean);
 }
 
-import { getEmbeddings } from './ollama';
+import { pipeline, env } from '@huggingface/transformers';
 
+// Force usage of remote models since we don't have them locally
+env.allowLocalModels = false;
+env.useBrowserCache = false;
 import { getCachedEmbeddings, saveCachedEmbeddings } from './db';
 
 const wordEmbeddings = new Map<string, number[]>();
 const wordsArray: string[] = []; // Keep an array for easier iteration/batching
 
-export async function initWordEmbeddings(
-	model: string,
+// Hardcoded model for browser
+const BROWSER_MODEL = 'Xenova/all-MiniLM-L6-v2';
+
+export async function initBrowserEmbeddings(
 	onProgress?: (count: number, total: number) => void
 ) {
 	if (wordsArray.length === 0) initWordList();
 
-	// Check if already loaded in memory for this model?
-	// The current implementation is simple global state.
-	// If switching models, we should probably clear the map or check if it matches.
-	// For now, let's assume we clear it if the model is deemed "new" (but we don't track which model generated current loaded data).
-	// To be safe, let's clear it if we are calling init again.
-	wordEmbeddings.clear();
-
 	// Check DB
-	const cached = await getCachedEmbeddings(model);
+	const cached = await getCachedEmbeddings(BROWSER_MODEL);
 	if (cached) {
-		console.log(`Loaded embeddings for ${model} from IndexedDB.`);
+		console.log(`Loaded embeddings for ${BROWSER_MODEL} from IndexedDB.`);
 		for (const [word, emb] of Object.entries(cached)) {
 			wordEmbeddings.set(word, emb);
 		}
@@ -59,41 +57,69 @@ export async function initWordEmbeddings(
 		return;
 	}
 
-	console.log(`Generating embeddings for ${model}...`);
-	const BATCH_SIZE = 100;
-	let processed = 0;
-	// Temporary object to store for DB save
+	console.log(`Loading model ${BROWSER_MODEL}...`);
+	// Initialize pipeline
+	const extractor = await pipeline('feature-extraction', BROWSER_MODEL);
+
+	console.log(`Generating embeddings for ${wordsArray.length} words...`);
+
 	const embeddingsToSave: Record<string, number[]> = {};
+	let processed = 0;
+
+	// Process one by one or small batches to keep UI responsive
+	// Transformers.js is fast, but 1000 items might block a bit.
+	// Let's do batches of 10.
+	const BATCH_SIZE = 10;
 
 	for (let i = 0; i < wordsArray.length; i += BATCH_SIZE) {
 		const batch = wordsArray.slice(i, i + BATCH_SIZE);
-		try {
-			const embeddings = await getEmbeddings(batch, model);
-			if (embeddings.length !== batch.length) {
-				console.error(
-					'Mismatch in embedding count',
-					batch.length,
-					embeddings.length
-				);
-				continue;
+
+		// Run inference
+		// pipeline input can be array of strings
+		const output = await extractor(batch, { pooling: 'mean', normalize: true });
+		// output is a Tensor of shape [batch_size, hidden_size]
+		// We need to extract rows.
+
+		// output.data is a Float32Array.
+		// output.dims is [n_sentences, embedding_dim]
+		const embeddingDim = output.dims ? output.dims[1] : 384;
+
+		for (let j = 0; j < batch.length; j++) {
+			if (!embeddingDim) continue;
+			const startStr = j * embeddingDim;
+			const endStr = startStr + embeddingDim;
+			const emb = Array.from(output.data.slice(startStr, endStr)) as number[];
+
+			const word = batch[j];
+			if (word) {
+				wordEmbeddings.set(word, emb);
+				embeddingsToSave[word] = emb;
 			}
-			batch.forEach((word, idx) => {
-				const emb = embeddings[idx];
-				if (emb) {
-					wordEmbeddings.set(word, emb);
-					embeddingsToSave[word] = emb;
-				}
-			});
-		} catch (e) {
-			console.error('Failed to load embeddings for batch', i, e);
 		}
+
 		processed += batch.length;
 		if (onProgress) onProgress(processed, wordsArray.length);
+
+		// Yield to main thread every few batches
+		if (i % 50 === 0) await new Promise((r) => setTimeout(r, 0));
 	}
 
 	// Save to DB
-	await saveCachedEmbeddings(model, embeddingsToSave);
+	await saveCachedEmbeddings(BROWSER_MODEL, embeddingsToSave);
 	console.log(`Loaded and saved embeddings for ${wordEmbeddings.size} words.`);
+}
+
+export async function getBrowserEmbedding(
+	text: string
+): Promise<number[] | null> {
+	try {
+		const extractor = await pipeline('feature-extraction', BROWSER_MODEL);
+		const output = await extractor(text, { pooling: 'mean', normalize: true });
+		return Array.from(output.data) as number[];
+	} catch (e) {
+		console.error('Single embedding failed', e);
+		return null;
+	}
 }
 
 export function findClosestWord(targetEmbedding: number[]): string | null {
@@ -103,8 +129,10 @@ export function findClosestWord(targetEmbedding: number[]): string | null {
 	let bestWord: string | null = null;
 
 	// Cosine similarity
-	// sim = (A . B) / (|A| * |B|)
-	// We assume Ollama embeddings might not be normalized, so we normalize.
+	// Since we normalized in pipeline ({ normalize: true }), we can just do dot product?
+	// Yes, if vectors are unit vectors, dot product == cosine similarity.
+	// We already normalized the targetEmbedding if it comes from getBrowserEmbedding with normalize: true.
+	// But let's be safe and compute full cosine just in case inputs vary.
 
 	const normTarget = magnitude(targetEmbedding);
 

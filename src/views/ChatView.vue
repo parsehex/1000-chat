@@ -42,9 +42,9 @@
   </div>
 </template>
 <script setup lang="ts">
-import { ref, onMounted, nextTick, watch } from 'vue'
-import { checkOllama, getTags, chat, getEmbeddings, type Message } from '../utils/ollama'
-import { isValid, initWordEmbeddings, findClosestWord } from '../utils/wordList'
+import { ref, onMounted, nextTick } from 'vue'
+import { checkOllama, getTags, chat, type Message } from '../utils/ollama'
+import { isValid, initBrowserEmbeddings, findClosestWord, getBrowserEmbedding } from '../utils/wordList'
 
 const isConnected = ref(false)
 const models = ref<string[]>([])
@@ -56,19 +56,17 @@ const loadingEmbeddings = ref(false)
 const loadingProgress = ref(0)
 const messagesContainer = ref<HTMLDivElement | null>(null)
 
-// When selectedModel changes, initialize embeddings
-// watch(selectedModel, async (newModel) => {
-//   if (newModel) {
-//     loadingEmbeddings.value = true
-//     loadingProgress.value = 0
-//     await initWordEmbeddings(newModel, (count, total) => {
-//       loadingProgress.value = Math.round((count / total) * 100)
-//     })
-//     loadingEmbeddings.value = false
-//   }
-// })
+// When selectedModel changes, we don't need to re-init embeddings anymore as they are model-independent (local)
 
 onMounted(async () => {
+  // Start initializing local embeddings immediately
+  loadingEmbeddings.value = true
+  initBrowserEmbeddings((count, total) => {
+    loadingProgress.value = Math.round((count / total) * 100)
+  }).then(() => {
+    loadingEmbeddings.value = false
+  })
+
   isConnected.value = await checkOllama()
   if (isConnected.value) {
     models.value = await getTags()
@@ -76,13 +74,6 @@ onMounted(async () => {
       const preferred = models.value.find(m => m.includes('llama3') || m.includes('gemma3'))
       selectedModel.value = preferred || models.value[0]!
     }
-
-    loadingEmbeddings.value = true
-    loadingProgress.value = 0
-    await initWordEmbeddings(selectedModel.value, (count, total) => {
-      loadingProgress.value = Math.round((count / total) * 100)
-    })
-    loadingEmbeddings.value = false
   }
 })
 
@@ -91,9 +82,6 @@ async function sendMessage() {
 
   const content = inputRaw.value.trim()
   inputRaw.value = ''
-
-  // TODO: Apply 1k filtering here (Task 5)
-  // For now just pass through
 
   // Find invalid words
   const tokens = content.split(/([a-zA-Z0-9'-]+)/g);
@@ -109,11 +97,8 @@ async function sendMessage() {
 
   if (uniqueInvalid.length > 0) {
     try {
-      // Get embeddings for invalid words
-      const invalidEmbeddings = await getEmbeddings(
-        uniqueInvalid,
-        selectedModel.value
-      );
+      // Get embeddings for invalid words using local browser model
+      const invalidEmbeddings = await Promise.all(uniqueInvalid.map(w => getBrowserEmbedding(w)));
 
       const replacements: Record<string, string> = {};
 
